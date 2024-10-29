@@ -24,8 +24,8 @@ locals {
   auto_audience_segmentation_query_template_file = "auto_audience_segmentation_query_template.sqlx"
   cltv_query_template_file                       = "cltv_query_template.sqlx"
   purchase_propensity_query_template_file        = "purchase_propensity_query_template.sqlx"
+  purchase_propensity_vbb_query_template_file    = "purchase_propensity_vbb_query_template.sqlx"
   churn_propensity_query_template_file           = "churn_propensity_query_template.sqlx"
-  measurement_protocol_payload_template_file     = "app_payload_template.jinja2"
   activation_container_image_id                  = "activation-pipeline"
   docker_repo_prefix                             = "${var.location}-docker.pkg.dev/${var.project_id}"
   activation_container_name                      = "dataflow/${local.activation_container_image_id}"
@@ -37,18 +37,13 @@ locals {
   trigger_function_account_name  = "trigger-function"
   trigger_function_account_email = "${local.app_prefix}-${local.trigger_function_account_name}@${var.project_id}.iam.gserviceaccount.com"
 
-  builder_service_account_name = "build-job"
+  builder_service_account_name  = "build-job"
   builder_service_account_email = "${local.app_prefix}-${local.builder_service_account_name}@${var.project_id}.iam.gserviceaccount.com"
 
-  activation_type_configuration_file              = "${local.source_root_dir}/templates/activation_type_configuration_template.tpl"
+  activation_type_configuration_file = "${local.source_root_dir}/templates/activation_type_configuration_template.tpl"
   # This is calculating a hash number on the file content to keep track of changes and trigger redeployment of resources 
   # in case the file content changes.
   activation_type_configuration_file_content_hash = filesha512(local.activation_type_configuration_file)
-
-  app_payload_template_file              = "${local.source_root_dir}/templates/app_payload_template.jinja2"
-  # This is calculating a hash number on the file content to keep track of changes and trigger redeployment of resources 
-  # in case the file content changes.
-  app_payload_template_file_content_hash = filesha512(local.activation_type_configuration_file)
 
   activation_application_dir = "${local.source_root_dir}/python/activation"
   activation_application_fileset = [
@@ -61,6 +56,9 @@ locals {
   # This is calculating a hash number on the files contents to keep track of changes and trigger redeployment of resources 
   # in case any of these files contents changes.
   activation_application_content_hash = sha512(join("", [for f in local.activation_application_fileset : fileexists(f) ? filesha512(f) : sha512("file-not-found")]))
+
+  ga4_setup_source_file              = "${local.source_root_dir}/python/ga4_setup/setup.py"
+  ga4_setup_source_file_content_hash = filesha512(local.ga4_setup_source_file)
   ga4_stream_id_set = toset(var.ga4_stream_id)
 }
 
@@ -70,7 +68,7 @@ data "google_project" "activation_project" {
 
 module "project_services" {
   source  = "terraform-google-modules/project-factory/google//modules/project_services"
-  version = "14.1.0"
+  version = "17.0.0"
 
   disable_dependent_services  = false
   disable_services_on_destroy = false
@@ -93,6 +91,7 @@ module "project_services" {
     "analyticsadmin.googleapis.com",
     "eventarc.googleapis.com",
     "run.googleapis.com",
+    "cloudkms.googleapis.com"
   ]
 }
 
@@ -304,9 +303,35 @@ resource "null_resource" "check_cloudbuild_api" {
   ]
 }
 
+# This resource executes gcloud commands to check whether the IAM API is enabled.
+# Since enabling APIs can take a few seconds, we need to make the deployment wait until the API is enabled before resuming.
+resource "null_resource" "check_cloudkms_api" {
+  provisioner "local-exec" {
+    command = <<-EOT
+    COUNTER=0
+    MAX_TRIES=100
+    while ! gcloud services list --project=${module.project_services.project_id} | grep -i "cloudkms.googleapis.com" && [ $COUNTER -lt $MAX_TRIES ]
+    do
+      sleep 6
+      printf "."
+      COUNTER=$((COUNTER + 1))
+    done
+    if [ $COUNTER -eq $MAX_TRIES ]; then
+      echo "cloud kms api is not enabled, terraform can not continue!"
+      exit 1
+    fi
+    sleep 20
+    EOT
+  }
+
+  depends_on = [
+    module.project_services
+  ]
+}
+
 module "bigquery" {
   source  = "terraform-google-modules/bigquery/google"
-  version = "~> 5.4"
+  version = "8.1.0"
 
   dataset_id                 = local.app_prefix
   dataset_name               = local.app_prefix
@@ -324,6 +349,7 @@ resource "null_resource" "create_custom_events" {
   triggers = {
     services_enabled_project = null_resource.check_analyticsadmin_api.id != "" ? module.project_services.project_id : var.project_id
     source_contents_hash     = local.activation_type_configuration_file_content_hash
+    source_file_content_hash = local.ga4_setup_source_file_content_hash
   }
   provisioner "local-exec" {
     command     = <<-EOT
@@ -340,6 +366,7 @@ resource "null_resource" "create_custom_dimensions" {
   for_each = local.ga4_stream_id_set
   triggers = {
     services_enabled_project = null_resource.check_analyticsadmin_api.id != "" ? module.project_services.project_id : var.project_id
+    source_file_content_hash = local.ga4_setup_source_file_content_hash
     #source_activation_type_configuration_hash = local.activation_type_configuration_file_content_hash 
     #source_activation_application_python_hash = local.activation_application_content_hash
   }
@@ -362,7 +389,7 @@ resource "google_artifact_registry_repository" "activation_repository" {
 
 module "pipeline_service_account" {
   source     = "terraform-google-modules/service-accounts/google"
-  version    = "~> 3.0"
+  version    = "4.4.0"
   project_id = null_resource.check_dataflow_api.id != "" ? module.project_services.project_id : var.project_id
   prefix     = local.app_prefix
   names      = [local.pipeline_service_account_name]
@@ -371,7 +398,7 @@ module "pipeline_service_account" {
     "${module.project_services.project_id}=>roles/dataflow.worker",
     "${module.project_services.project_id}=>roles/bigquery.dataEditor",
     "${module.project_services.project_id}=>roles/bigquery.jobUser",
-    "${module.project_services.project_id}=>roles/artifactregistry.writer", 
+    "${module.project_services.project_id}=>roles/artifactregistry.writer",
   ]
   display_name = "Dataflow worker Service Account"
   description  = "Activation Dataflow worker Service Account"
@@ -379,7 +406,7 @@ module "pipeline_service_account" {
 
 module "trigger_function_account" {
   source     = "terraform-google-modules/service-accounts/google"
-  version    = "~> 3.0"
+  version    = "4.4.0"
   project_id = null_resource.check_pubsub_api.id != "" ? module.project_services.project_id : var.project_id
   prefix     = local.app_prefix
   names      = [local.trigger_function_account_name]
@@ -404,17 +431,85 @@ data "external" "ga4_measurement_properties" {
   for_each    = local.ga4_stream_id_set
   program     = ["bash", "-c", "${local.poetry_run_alias} ga4-setup --ga4_resource=measurement_properties --ga4_property_id=${var.ga4_property_id} --ga4_stream_id=${each.value}"]
   working_dir = local.source_root_dir
+
   depends_on = [
     module.project_services
   ]
+}
+
+
+# It's used to create unique names for resources like KMS key rings or crypto keys, 
+# ensuring they don't clash with existing resources.
+resource "random_id" "random_suffix" {
+  byte_length = 2
+}
+
+# This ensures that Secret Manager has a service identity within your project. 
+# This identity is crucial for securely managing secrets and allowing Secret Manager 
+# to interact with other Google Cloud services on your behalf.
+resource "google_project_service_identity" "secretmanager_sa" {
+  provider = google-beta
+  project = null_resource.check_cloudkms_api.id != "" ? module.project_services.project_id : var.project_id
+  service = "secretmanager.googleapis.com"
+}
+ # This Key Ring can then be used to store and manage encryption keys for various purposes, 
+ # such as encrypting data at rest or protecting secrets.
+resource "google_kms_key_ring" "key_ring_regional" {
+  name     = "key_ring_regional-${random_id.random_suffix.hex}"
+  # If you want your replicas in other locations, change the location in the var.location variable passed as a parameter to this submodule.
+  # if you your replicas stored global, set the location = "global".
+  location = var.location
+  project  = null_resource.check_cloudkms_api.id != "" ? module.project_services.project_id : var.project_id
+}
+
+# This key can then be used for various encryption operations, 
+# such as encrypting data before storing it in Google Cloud Storage 
+# or protecting secrets within your application.
+resource "google_kms_crypto_key" "crypto_key_regional" {
+  name     = "crypto-key-${random_id.random_suffix.hex}"
+  key_ring = google_kms_key_ring.key_ring_regional.id
+}
+
+# Defines an IAM policy that explicitly grants the Secret Manager service account 
+# the ability to encrypt and decrypt data using a specific CryptoKey. This is a 
+# common pattern for securely managing secrets, allowing Secret Manager to encrypt 
+# or decrypt data without requiring direct access to the underlying encryption key material.
+data "google_iam_policy" "crypto_key_encrypter_decrypter" {
+  binding {
+    role = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+
+    members = [
+      "serviceAccount:${google_project_service_identity.secretmanager_sa.email}"
+    ]
+  }
+
+  depends_on = [
+    google_project_service_identity.secretmanager_sa,
+    google_kms_key_ring.key_ring_regional,
+    google_kms_crypto_key.crypto_key_regional
+  ]
+}
+
+# It sets the IAM policy for a KMS CryptoKey, specifically granting permissions defined 
+# in another data source.
+resource "google_kms_crypto_key_iam_policy" "crypto_key" {
+  crypto_key_id = google_kms_crypto_key.crypto_key_regional.id
+  policy_data = data.google_iam_policy.crypto_key_encrypter_decrypter.policy_data
+}
+
+# It sets the IAM policy for a KMS Key Ring, granting specific permissions defined 
+# in a data source.
+resource "google_kms_key_ring_iam_policy" "key_ring" {
+  key_ring_id = google_kms_key_ring.key_ring_regional.id
+  policy_data = data.google_iam_policy.crypto_key_encrypter_decrypter.policy_data
 }
 
 # This module stores the values ga4-measurement-id and ga4-measurement-secret for each data stream in Google Cloud Secret Manager.
 module "data_stream_secrets" {
   for_each   = local.ga4_stream_id_set
   source     = "GoogleCloudPlatform/secret-manager/google"
-  version    = "~> 0.1"
-  project_id = null_resource.check_secretmanager_api.id != "" ? module.project_services.project_id : var.project_id
+  version    = "0.4.0"
+  project_id = google_kms_crypto_key_iam_policy.crypto_key.etag != "" && google_kms_key_ring_iam_policy.key_ring.etag != "" ? module.project_services.project_id : var.project_id
   secrets = [
     {
       name = "ga4-data-stream-${each.value}"
@@ -424,22 +519,41 @@ module "data_stream_secrets" {
           "measurement-secret" = data.external.ga4_measurement_properties[each.value].result["measurement_secret"]
         }
       )
-      automatic_replication = true
-    }
+      automatic_replication = false
+    },
   ]
 
+  # By commenting the user_managed_replication block, you will deploy replicas that may store the secret in different locations in the globe.
+  # This is not a desired behaviour, make sure you're aware of it before doing it.
+  # By default, to respect resources location, we prevent resources from being deployed globally by deploying secrets in the same region of the compute resources.
+  user_managed_replication = {
+    "ga4-data-stream-${each.value}" = [
+      # If you want your replicas in other locations, uncomment the following lines and add them here.
+      # Check this example, as reference: https://github.com/GoogleCloudPlatform/terraform-google-secret-manager/blob/main/examples/multiple/main.tf#L91
+      {
+        location = var.location
+        kms_key_name = google_kms_crypto_key.crypto_key_regional.id
+      }
+    ]
+  }
+
   depends_on = [
-    data.external.ga4_measurement_properties
+    data.external.ga4_measurement_properties,
+    google_kms_crypto_key.crypto_key_regional,
+    google_kms_key_ring.key_ring_regional,
+    google_project_service_identity.secretmanager_sa,
+    google_kms_crypto_key_iam_policy.crypto_key,
+    google_kms_key_ring_iam_policy.key_ring
   ]
 }
 
 # This module creates a Cloud Storage bucket to be used by the Activation Application
 module "pipeline_bucket" {
-  source        = "terraform-google-modules/cloud-storage/google//modules/simple_bucket"
-  version       = "~> 3.4.1"
-  project_id    = null_resource.check_dataflow_api.id != "" ? module.project_services.project_id : var.project_id
-  name          = "${local.app_prefix}-app-${module.project_services.project_id}"
-  location      = var.location
+  source     = "terraform-google-modules/cloud-storage/google//modules/simple_bucket"
+  version    = "6.1.0"
+  project_id = null_resource.check_dataflow_api.id != "" ? module.project_services.project_id : var.project_id
+  name       = "${local.app_prefix}-app-${module.project_services.project_id}"
+  location   = var.location
   # When deleting a bucket, this boolean option will delete all contained objects. 
   # If false, Terraform will fail to delete buckets which contain objects.
   force_destroy = true
@@ -471,8 +585,8 @@ resource "google_project_iam_member" "cloud_build_job_service_account" {
     module.project_services,
     null_resource.check_artifactregistry_api,
     data.google_project.project,
-    ]
-  
+  ]
+
   project = null_resource.check_artifactregistry_api.id != "" ? module.project_services.project_id : var.project_id
   member  = "serviceAccount:${var.project_number}-compute@developer.gserviceaccount.com"
 
@@ -516,16 +630,16 @@ resource "google_project_iam_member" "cloud_build_job_service_account" {
 }
 
 data "google_project" "project" {
-  project_id    = null_resource.check_cloudbuild_api != "" ? module.project_services.project_id : var.project_id
+  project_id = null_resource.check_cloudbuild_api != "" ? module.project_services.project_id : var.project_id
 }
 
 # This module creates a Cloud Storage bucket to be used by the Cloud Build Log Bucket
 module "build_logs_bucket" {
-  source        = "terraform-google-modules/cloud-storage/google//modules/simple_bucket"
-  version       = "~> 3.4.1"
-  project_id    = null_resource.check_cloudbuild_api != "" ? module.project_services.project_id : var.project_id
-  name          = "${local.app_prefix}-logs-${module.project_services.project_id}"
-  location      = var.location
+  source     = "terraform-google-modules/cloud-storage/google//modules/simple_bucket"
+  version    = "6.1.0"
+  project_id = null_resource.check_cloudbuild_api != "" ? module.project_services.project_id : var.project_id
+  name       = "${local.app_prefix}-logs-${module.project_services.project_id}"
+  location   = var.location
   # When deleting a bucket, this boolean option will delete all contained objects. 
   # If false, Terraform will fail to delete buckets which contain objects.
   force_destroy = true
@@ -543,8 +657,8 @@ module "build_logs_bucket" {
 
   iam_members = [
     {
-    role   = "roles/storage.admin"
-    member = "serviceAccount:${var.project_number}-compute@developer.gserviceaccount.com"
+      role   = "roles/storage.admin"
+      member = "serviceAccount:${var.project_number}-compute@developer.gserviceaccount.com"
     }
   ]
 
@@ -552,13 +666,6 @@ module "build_logs_bucket" {
     data.google_project.project,
     google_project_iam_member.cloud_build_job_service_account
   ]
-}
-
-# This resource creates a bucket object using as content the measurement_protocol_payload_template_file file.
-resource "google_storage_bucket_object" "measurement_protocol_payload_template_file" {
-  name   = "${local.configuration_folder}/${local.measurement_protocol_payload_template_file}"
-  source = "${local.template_dir}/${local.measurement_protocol_payload_template_file}"
-  bucket = module.pipeline_bucket.name
 }
 
 # This resource creates a bucket object using as content the audience_segmentation_query_template_file file.
@@ -641,6 +748,24 @@ resource "google_storage_bucket_object" "purchase_propensity_query_template_file
   bucket  = module.pipeline_bucket.name
 }
 
+# This resource creates a bucket object using as content the purchase_propensity_vbb_query_template_file file.
+data "template_file" "purchase_propensity_vbb_query_template_file" {
+  template = file("${local.template_dir}/activation_query/${local.purchase_propensity_vbb_query_template_file}")
+
+  vars = {
+    mds_project_id        = var.mds_project_id
+    mds_dataset_suffix    = var.mds_dataset_suffix
+    activation_project_id = var.project_id
+    dataset               = module.bigquery.bigquery_dataset.dataset_id
+  }
+}
+
+resource "google_storage_bucket_object" "purchase_propensity_vbb_query_template_file" {
+  name    = "${local.configuration_folder}/${local.purchase_propensity_vbb_query_template_file}"
+  content = data.template_file.purchase_propensity_vbb_query_template_file.rendered
+  bucket  = module.pipeline_bucket.name
+}
+
 # This data resources creates a data resource that renders a template file and stores the rendered content in a variable.
 data "template_file" "activation_type_configuration" {
   template = file("${local.template_dir}/activation_type_configuration_template.tpl")
@@ -650,16 +775,16 @@ data "template_file" "activation_type_configuration" {
     auto_audience_segmentation_query_template_gcs_path = "gs://${module.pipeline_bucket.name}/${google_storage_bucket_object.auto_audience_segmentation_query_template_file.output_name}"
     cltv_query_template_gcs_path                       = "gs://${module.pipeline_bucket.name}/${google_storage_bucket_object.cltv_query_template_file.output_name}"
     purchase_propensity_query_template_gcs_path        = "gs://${module.pipeline_bucket.name}/${google_storage_bucket_object.purchase_propensity_query_template_file.output_name}"
+    purchase_propensity_vbb_query_template_gcs_path    = "gs://${module.pipeline_bucket.name}/${google_storage_bucket_object.purchase_propensity_vbb_query_template_file.output_name}"
     churn_propensity_query_template_gcs_path           = "gs://${module.pipeline_bucket.name}/${google_storage_bucket_object.churn_propensity_query_template_file.output_name}"
-    measurement_protocol_payload_template_gcs_path     = "gs://${module.pipeline_bucket.name}/${google_storage_bucket_object.measurement_protocol_payload_template_file.output_name}"
   }
 }
 
 # This resource creates a bucket object using as content the activation_type_configuration.json file.
 resource "google_storage_bucket_object" "activation_type_configuration_file" {
-  name           = "${local.configuration_folder}/activation_type_configuration.json"
-  content        = data.template_file.activation_type_configuration.rendered
-  bucket         = module.pipeline_bucket.name
+  name    = "${local.configuration_folder}/activation_type_configuration.json"
+  content = data.template_file.activation_type_configuration.rendered
+  bucket  = module.pipeline_bucket.name
   # Detects md5hash changes to redeploy this file to the GCS bucket.
   detect_md5hash = base64encode("${local.activation_type_configuration_file_content_hash}${local.activation_application_content_hash}")
 }
@@ -667,7 +792,7 @@ resource "google_storage_bucket_object" "activation_type_configuration_file" {
 # This module submits a gcloud build to build a docker container image to be used by the Activation Application
 module "activation_pipeline_container" {
   source  = "terraform-google-modules/gcloud/google"
-  version = "3.1.2"
+  version = "3.5.0"
 
   platform = "linux"
 
@@ -687,8 +812,7 @@ module "activation_pipeline_container" {
 # This module executes a gcloud command to build a dataflow flex template and uploads it to Dataflow
 module "activation_pipeline_template" {
   source                = "terraform-google-modules/gcloud/google"
-  version               = "3.1.2"
-  additional_components = ["gsutil"]
+  version               = "3.5.0"
 
   platform         = "linux"
   create_cmd_body  = "dataflow flex-template build --project=${module.project_services.project_id} \"gs://${module.pipeline_bucket.name}/dataflow/templates/${local.activation_container_image_id}.json\" --image \"${local.docker_repo_prefix}/${google_artifact_registry_repository.activation_repository.name}/${local.activation_container_name}:latest\" --sdk-language \"PYTHON\" --metadata-file \"${local.pipeline_source_dir}/metadata.json\""
@@ -718,11 +842,11 @@ data "archive_file" "activation_trigger_source" {
 
 # This module creates a Cloud Sorage bucket and sets the trigger_function_account_email as the admin.
 module "function_bucket" {
-  source        = "terraform-google-modules/cloud-storage/google//modules/simple_bucket"
-  version       = "~> 3.4.1"
-  project_id    = null_resource.check_cloudfunctions_api.id != "" ? module.project_services.project_id : var.project_id
-  name          = "${local.app_prefix}-trigger-${module.project_services.project_id}"
-  location      = var.location
+  source     = "terraform-google-modules/cloud-storage/google//modules/simple_bucket"
+  version    = "6.1.0"
+  project_id = null_resource.check_cloudfunctions_api.id != "" ? module.project_services.project_id : var.project_id
+  name       = "${local.app_prefix}-trigger-${module.project_services.project_id}"
+  location   = var.location
   # When deleting a bucket, this boolean option will delete all contained objects. 
   # If false, Terraform will fail to delete buckets which contain objects.
   force_destroy = true
@@ -819,7 +943,7 @@ resource "google_cloudfunctions2_function" "activation_trigger_cf" {
 # This modules runs cloud commands that adds an invoker policy binding to a Cloud Function, allowing a specific service account to invoke the function.
 module "add_invoker_binding" {
   source  = "terraform-google-modules/gcloud/google"
-  version = "3.1.2"
+  version = "3.5.0"
 
   platform = "linux"
 

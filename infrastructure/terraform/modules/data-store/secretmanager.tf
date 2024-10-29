@@ -14,11 +14,26 @@
 
 resource "google_secret_manager_secret" "github-secret" {
   secret_id = "Github_token"
-  project   = null_resource.check_secretmanager_api.id != "" ?  module.data_processing_project_services.project_id : data.google_project.data_processing.project_id
+  project   = null_resource.check_secretmanager_api.id != "" ? module.data_processing_project_services.project_id : data.google_project.data_processing.project_id
 
+  # This replication strategy will deploy replicas that may store the secret in different locations in the globe.
+  # This is not a desired behaviour, make sure you're aware of it before enabling it.
+  #replication {
+  #  auto {}
+  #}
+
+  # By default, to respect resources location, we prevent resources from being deployed globally by deploying secrets in the same region of the compute resources.
+  # If the replication strategy is seto to `auto {}` above, comment the following lines or else there will be an error being issued by terraform.
   replication {
-    #automatic = true
-    auto {}
+    user_managed {
+      replicas {
+        location = var.google_default_region
+      }
+      # If you want your replicas in other locations, uncomment the following lines and add them here.
+      #replicas {
+      #  location = "us-east1"
+      #}
+    }
   }
 
   depends_on = [
@@ -28,7 +43,7 @@ resource "google_secret_manager_secret" "github-secret" {
 }
 
 resource "google_secret_manager_secret_version" "secret-version-github" {
-  secret = google_secret_manager_secret.github-secret.id
+  secret      = google_secret_manager_secret.github-secret.id
   secret_data = var.dataform_github_token
 
   #deletion_policy = "DISABLE"

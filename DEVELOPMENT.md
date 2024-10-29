@@ -2,7 +2,7 @@
 Marketing Analytics Jumpstart consists of an easy, extensible and automated implementation of an end-to-end solution that enables Marketing Technology teams to store, transform, enrich with 1PD and analyze marketing data, and programmatically send predictive events to Google Analytics 4 to support conversion optimization and remarketing campaigns.
 
 ## Developer pre-requisites
-Use Visual Studio Code to develop the solution. Install Gemini Code Assistant, Docker, Github, Hashicopr Terraform, Jinja extensions.
+Use Visual Studio Code to develop the solution. Install Gemini Code Assistant, Docker, GitHub, Hashicorp, Terraform, Jinja extensions.
 You should have Python 3, Poetry, Terraform, Git and Docker installed in your developer terminal environment.
 
 ## Preparing development environment
@@ -65,7 +65,6 @@ Here's a brief breakdown of the contents of each folder:
 * * `procedures/`: This folder contains the JINJA template files with the `.sqlx` extension used to generate the stored procedures deployed in BigQuery.
 * * `queries/`: This folder contains the JINJA template files with the `.sqlx` extension used to generate the queries deployed in BigQuery.
 * `templates/`:
-* * `app_payload_template.jinja2`: This file defines the JINJA template used to generate the payload for the Measurement Protocol API used by the Activation Application.
 * * `activation_query`: This folder contains the JINJA template files with the `.sqlx` extension used to generate the SQL queries for each use case used by the Activation Application to get all the predictions to be prepared and send to Google Analytics 4.
 
 ## Out-of-the-box configuration parameters provided by the solution
