@@ -52,6 +52,7 @@ activation_project_id = "Project ID where activation resources will be created"
 ####################  GA4 VARIABLES  #################################
 
 ga4_property_id        = "Google Analytics property id"
+# List every GA4 data stream that you want to activate on (e.g ["web-stream-1", "web-stream-2", "app-stream-1"])
 ga4_stream_id          = ["Google Analytics data stream id:s"]
 ga4_measurement_id     = "Google Analytics measurement id"
 ga4_measurement_secret = "Google Analytics measurement secret"
