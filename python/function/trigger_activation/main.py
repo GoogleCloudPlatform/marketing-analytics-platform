@@ -56,6 +56,7 @@ def subscribe(cloud_event):
   # The datastreams used for activation
   ga4_data_streams = os.environ.get('GA4_DATA_STREAMS').split(',')
 
+  # Iterate over the list of data streams as configured in the terraform variable: ga4_stream_id
   for ga4_data_stream_id in ga4_data_streams:
     ga4_data_stream_config = json.loads(os.environ.get(f'GA4_DATA_STREAM_{ga4_data_stream_id}'))
 
